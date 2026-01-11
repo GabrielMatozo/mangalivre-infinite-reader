@@ -10,7 +10,7 @@ Um userscript que transforma a experiência de leitura em sites de mangas, ofere
 - **Carregamento Otimizado**: Lazy loading de imagens para economia de dados e carregamento mais rápido.
 - **Rolagem Automática**: Ative a rolagem automática com duas velocidades ajustáveis (lenta e rápida).
 - **Histórico de Leitura**: Salva o progresso de cada manga localmente, incluindo o último capítulo lido e o link direto para retomar a leitura.
-- **Interface Minimalista**: Remove anúncios e elementos desnecessários, focando apenas na leitura do manga, para uma experiência limpa e imersiva.
+- **Interface Minimalista**: Remove anúncios e elementos desnecessários, focando exclusivamente na leitura do manga. (Essa funcionalidade se aplica apenas ao modo de leitura, a página inicial e a página do manga permanecem inalteradas).
 - **Biblioteca de Mangas**: Modal para gerenciar o histórico de leitura, com links diretos para capítulos salvos e opção de exclusão.
 - **Compatibilidade com Mobile**: Gestos de toque otimizados para dispositivos móveis.
 
