@@ -12,6 +12,36 @@
 (function () {
   "use strict";
 
+  (function () {
+    var _origSetInterval = window.setInterval;
+    var _origSetTimeout = window.setTimeout;
+    var _origRaf = window.requestAnimationFrame;
+    function _hasDbg(fn) {
+      try { return /\bdebugger\b/.test(fn.toString()); } catch (e) { return false; }
+    }
+    window.setInterval = function (fn, d) {
+      if (typeof fn === "function" && d < 2000 && _hasDbg(fn)) return 0;
+      return _origSetInterval.call(window, fn, d);
+    };
+    window.setTimeout = function (fn, d) {
+      if (typeof fn === "function" && d < 2000 && _hasDbg(fn)) return 0;
+      return _origSetTimeout.call(window, fn, d);
+    };
+    window.requestAnimationFrame = function (fn) {
+      if (typeof fn === "function" && _hasDbg(fn)) return 0;
+      return _origRaf.call(window, fn);
+    };
+    function _wrapConsole(orig) {
+      return function () {
+        if (arguments.length > 1 && typeof arguments[0] === "string" && arguments[0].indexOf("%c") !== -1) return;
+        return orig.apply(console, arguments);
+      };
+    }
+    console.log = _wrapConsole(console.log);
+    console.warn = _wrapConsole(console.warn);
+    console.error = _wrapConsole(console.error);
+  })();
+
   const AUTO_START = true;
   const STORAGE_KEY = "mangalivre_custom_lib_v1";
   const AUTO_SCROLL_SPEEDS = [1.9, 3.4];
@@ -28,7 +58,6 @@
     {
       id: "toonlivre",
       domain: /^https?:\/\/([a-z0-9-]+\.)?toonlivre\.net/,
-      chapterRegex: /\/[\w-]+\/([\d]+(?:[\.\-][\d]+)?)/,
       apiUrl: "https://toonlivre.net/api",
       _signature: null,
       _sigPromise: null,
@@ -248,6 +277,7 @@
   var autoScrollTouchEndHandler = null;
   var autoScrollTouchCancelHandler = null;
   var pendingNextChapter = null;
+  var _readerSession = 0;
   var _origPushState = history.pushState,
     _origReplaceState = history.replaceState;
 
@@ -364,7 +394,7 @@
             transition: opacity 0.3s ease;
         }
 
-        #manga-loader { position: fixed; top: 0; left: 0; height: 2px; background: transparent; width: 0%; transition: width 0.2s; z-index: 10003; }
+        #manga-loader { position: fixed; top: 0; left: 0; height: 2px; background: #ff5500; width: 0%; transition: width 0.2s; z-index: 10003; }
 
         .manga-chapter-wrapper {
             width: 100%;
@@ -479,20 +509,17 @@
     }
   }
 
-  var _adBlockersApplied = false;
-  function applyAdBlockers() {
-    if (_adBlockersApplied) return;
-    _adBlockersApplied = true;
-    const origFetch = window.fetch;
+  (function () {
+    var _origFetch = window.fetch;
     window.fetch = function (url, opts) {
       var u = typeof url === "string" ? url : url && url.url ? url.url : "";
       if (u.includes("/api/pub") || (u && !isAllowed(u))) {
         console.log("[TL] blocked fetch:", u);
         return Promise.resolve(new Response("{}", { status: 204 }));
       }
-      return origFetch.call(window, url, opts);
+      return _origFetch.call(window, url, opts);
     };
-    const origXhrOpen = XMLHttpRequest.prototype.open;
+    var _origXhrOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function () {
       if (
         arguments[1] &&
@@ -502,19 +529,28 @@
         console.log("[TL] blocked XHR:", arguments[1]);
         arguments[1] = "about:blank";
       }
-      return origXhrOpen.apply(this, arguments);
+      return _origXhrOpen.apply(this, arguments);
     };
-    const origSendBeacon = navigator.sendBeacon;
+    var _origSendBeacon = navigator.sendBeacon;
     navigator.sendBeacon = function (url, data) {
       if (url && typeof url === "string" && !isAllowed(url)) {
         console.log("[TL] blocked beacon:", url);
         return false;
       }
-      return origSendBeacon.call(this, url, data);
+      return _origSendBeacon.call(this, url, data);
     };
-    window.open = function () {
-      return null;
-    };
+    window.open = function () { return null; };
+  })();
+
+  var _adBlockOverrides = false;
+  function applyAdBlockers() {
+    if (_adBlockOverrides) {
+      if (adCleaner) adCleaner.disconnect();
+      if (adBlockClickHandler) {
+        document.removeEventListener("click", adBlockClickHandler, true);
+      }
+    }
+    _adBlockOverrides = true;
     Array.from(document.querySelectorAll(AD_SELECTOR)).forEach(function (el) {
       el.remove();
     });
@@ -948,7 +984,6 @@
       document.removeEventListener("click", adBlockClickHandler, true);
       adBlockClickHandler = null;
     }
-    _adBlockersApplied = false;
     if (uiToggleClickHandler) {
       document.removeEventListener("click", uiToggleClickHandler);
       uiToggleClickHandler = null;
@@ -1037,7 +1072,7 @@
     onScrollHandler = function () {
       var nearBottom =
         window.innerHeight + window.scrollY >=
-        document.body.offsetHeight - SCROLL_THRESHOLD;
+        document.documentElement.scrollHeight - SCROLL_THRESHOLD;
       if (nearBottom)
         console.log(
           "[TL] scroll near bottom, pendingNext:",
@@ -1186,6 +1221,7 @@
     isChapterLoading = true;
 
     currentFetchPromise = (async function () {
+      var session = _readerSession;
       if (loaderBar) loaderBar.style.width = "70%";
 
       if (!pendingNextChapter) {
@@ -1220,6 +1256,11 @@
                 (result.nextChapter ? result.nextChapter.chapterNum : "none")
             : "null",
         );
+
+        if (session !== _readerSession) {
+          console.log("[TL] sessão desatualizada, ignorando resultado");
+          return;
+        }
 
         if (result && result.pages.length > 0) {
           console.log(
@@ -1402,6 +1443,7 @@
 
   function initReaderMode() {
     console.log("[TL] initReaderMode start");
+    _readerSession++;
     activeSite = detectSite();
     console.log("[TL] detectSite:", activeSite ? activeSite.id : "null");
     if (!activeSite) return;
