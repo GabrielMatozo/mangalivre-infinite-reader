@@ -1,83 +1,274 @@
-
 // ==UserScript==
-// @name         Leitor Infinito do MangaLivre
-// @version      1.0
-// @description  Userscript para leitura de mangás com rolagem infinita, lazy loading e interface minimalista
-// @match        *://mangalivre.tv/*
-// @match        *://*.mangalivre.tv/*
-// @match        *://mangalivre.to/*
-// @match        *://*.mangalivre.to/*
-// @run-at       document-idle
+// @name         Leitor Infinito de Mangá
+// @version      1.2
+// @description  Rolagem infinita, lazy loading e interface minimalista para leitura de mangás
+// @match        *://toonlivre.net/*
+// @match        *://*.toonlivre.net/*
+// @run-at       document-start
+// @require      https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js
 // @license      MIT
 // ==/UserScript==
 
 (function () {
-    'use strict';
+  "use strict";
 
-    const AUTO_START = true;
-    const STORAGE_KEY = 'mangalivre_custom_lib_v1';
-    const IMAGE_SELECTORS = '.reader-area img, .reading-content img, .reader-images img';
-    const CHAPTER_REGEX = /capitulo-([\d]+(?:[\.\-][\d]+)?)/;
+  const AUTO_START = true;
+  const STORAGE_KEY = "mangalivre_custom_lib_v1";
+  const AUTO_SCROLL_SPEEDS = [1.9, 3.4];
+  const SCROLL_THRESHOLD = 10000;
+  const SCROLL_INTERVAL = 16;
+  const DOUBLE_TAP_DELAY = 300;
+  const EAGER_LOAD_COUNT = 5;
+  const SAVE_DEBOUNCE_DELAY = 500;
+  const MAX_LIBRARY_SIZE = 100;
+  const AD_SELECTOR =
+    'iframe, object, embed, [id*="google_ads"], [id*="ad-"], [class*="ads"], [class*="ad-"]';
 
-    function normalizeChapterNum(chapter) {
-        return chapter ? String(chapter).replace(/-/g, '.') : chapter;
+  const SITES = [
+    {
+      id: "toonlivre",
+      domain: /^https?:\/\/([a-z0-9-]+\.)?toonlivre\.net/,
+      chapterRegex: /\/[\w-]+\/([\d]+(?:[\.\-][\d]+)?)/,
+      apiUrl: "https://toonlivre.net/api",
+      _signature: null,
+      _sigPromise: null,
+      _cryptoKey: null,
+      _cryptoKeyDate: null,
+      ensureSignature: function () {
+        const self = this;
+        if (self._signature) return Promise.resolve(self._signature);
+        if (self._sigPromise) return self._sigPromise;
+        self._sigPromise = fetch(self.apiUrl + "/seed", {
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        })
+          .then(function (r) {
+            return r.json();
+          })
+          .then(
+            function (data) {
+              console.log("[TL] seed body:", JSON.stringify(data).slice(0, 80));
+              let sig =
+                data.signature || data.token || data.key || data.seed || "";
+              if (
+                !sig &&
+                typeof data === "string" &&
+                data.split(".").length === 3
+              )
+                sig = data;
+              self._signature = sig;
+              self._sigPromise = null;
+              return sig;
+            },
+            function (err) {
+              self._sigPromise = null;
+              throw err;
+            },
+          );
+        return self._sigPromise;
+      },
+      _getCryptoKey: function () {
+        const self = this;
+        const today = new Date().toISOString().slice(0, 10);
+        if (self._cryptoKey && self._cryptoKeyDate === today)
+          return self._cryptoKey;
+        const s = today + "toonlivre.net::w3" + "r7_5m2_k";
+        const hash = CryptoJS.SHA256(s).toString(CryptoJS.enc.Hex).slice(0, 8);
+        self._cryptoKey = "Phantom-Tide-Harvest8" + hash;
+        self._cryptoKeyDate = today;
+        return self._cryptoKey;
+      },
+      apiFetch: function (path) {
+        const self = this;
+        return self.ensureSignature().then(function (sig) {
+          return fetch(self.apiUrl + path, {
+            credentials: "include",
+            headers: {
+              Accept: "application/json",
+              "x-toon-signature": sig,
+            },
+          }).then(function (r) {
+            console.log("[TL] apiFetch response", path, r.status);
+            const sig2 = r.headers.get("x-toon-signature");
+            if (sig2) {
+              console.log("[TL] refreshed signature");
+              self._signature = sig2;
+            }
+            const dataKey = r.headers.get("x-toon-datakey");
+            if (dataKey && r.ok) {
+              console.log("[TL] decrypting", path, "key:", dataKey);
+              return r.json().then(function (body) {
+                const enc = body && body[dataKey];
+                if (!enc) return body;
+                const pass = self._getCryptoKey();
+                const dec = CryptoJS.Rabbit.decrypt(enc, pass).toString(
+                  CryptoJS.enc.Utf8,
+                );
+                if (!dec) return body;
+                const result = JSON.parse(dec);
+                console.log(
+                  "[TL] decrypted OK, keys:",
+                  Object.keys(result).join(","),
+                );
+                return result;
+              });
+            }
+            return r.json();
+          });
+        });
+      },
+      isChapterPage: function () {
+        var match = window.location.pathname.match(
+          /^\/([\w-]+)\/([\d]+(?:[\.\-][\d]+)?)/,
+        );
+        return match !== null;
+      },
+      getTitle: function () {
+        var match = window.location.pathname.match(/^\/([\w-]+)\/[\d]+/);
+        if (match) {
+          return match[1].replace(/-/g, " ").replace(/\b\w/g, function (c) {
+            return c.toUpperCase();
+          });
+        }
+        return document.title.trim();
+      },
+      getMangaId: function () {
+        var match = window.location.pathname.match(/^\/([\w-]+)\/[\d]+/);
+        return match ? match[1] : null;
+      },
+      getChapterNumber: function () {
+        var match = window.location.pathname.match(
+          /^\/([\w-]+)\/([\d]+(?:[\.\-][\d]+)?)/,
+        );
+        return match ? match[2].replace(/-/g, ".") : null;
+      },
+      fetchChapterPages: function (mangaSlug, chapterNum) {
+        const self = this;
+        return self
+          .apiFetch("/manga-by-slug/" + mangaSlug)
+          .then(function (data) {
+            if (!data || !data.chapters) return null;
+            const chs = data.chapters;
+            console.log(
+              "[TL] fetching ch",
+              chapterNum,
+              "total chapters:",
+              chs.length,
+              "sample:",
+              chs[0] ? chs[0].number + "/" + chs[0].id : "none",
+            );
+            let idx = -1;
+            for (let i = 0; i < chs.length; i++) {
+              const an = String(chs[i].number).replace(/^0+/, "") || "0";
+              const bn = String(chapterNum).replace(/^0+/, "") || "0";
+              if (an === bn) {
+                idx = i;
+                break;
+              }
+            }
+            if (idx === -1) {
+              console.log("[TL] chapter", chapterNum, "not found");
+              return null;
+            }
+            const ch = chs[idx];
+            const isDesc =
+              chs.length > 1 &&
+              !isNaN(Number(chs[0].number)) &&
+              Number(chs[0].number) > Number(chs[chs.length - 1].number);
+            const nextIdx = isDesc ? idx - 1 : idx + 1;
+            const nextCh =
+              nextIdx >= 0 && nextIdx < chs.length ? chs[nextIdx] : null;
+            console.log(
+              "[TL] ch match idx:",
+              idx,
+              "nextIdx:",
+              nextIdx,
+              "isDesc:",
+              isDesc,
+              "nextNum:",
+              nextCh ? nextCh.number : "none",
+            );
+            return self
+              .apiFetch("/mangas/" + data.id + "/chapters/" + ch.id)
+              .then(function (pageData) {
+                return {
+                  pages: pageData.pages || [],
+                  nextChapter: nextCh
+                    ? {
+                        mangaSlug: mangaSlug,
+                        chapterNum: nextCh.number,
+                        url:
+                          window.location.origin +
+                          "/" +
+                          mangaSlug +
+                          "/" +
+                          nextCh.number,
+                      }
+                    : null,
+                  title: data.title,
+                };
+              });
+          });
+      },
+    },
+  ];
+
+  var activeSite = null;
+  var isZenModeActive = false;
+  var isChapterLoading = false;
+  var currentFetchPromise = null;
+  var isUiVisible = true;
+  var currentTitle = "";
+  var urlObserver = null;
+  var lastPersistedChapter = null;
+  var isAutoScrollEnabled = false;
+  var autoScrollSpeedIndex = 1;
+  var lastTapTimestamp = 0;
+  var tapCount = 0;
+  var touchStartY = 0;
+  var touchMoved = false;
+  var onScrollHandler = null;
+  var onWheelHandler = null;
+  var onBeforeUnloadHandler = null;
+  var autoScrollAnimationFrameId = null;
+  var statusHud = null;
+  var loaderBar = null;
+  var autoScrollButton = null;
+  var saveDebounceTimeout = null;
+  var doubleTapTimer = null;
+  var loaderHideTimeout = null;
+  var lazyLoadIntersectionObserver = null;
+  var onModalClose = null;
+  var adCleaner = null;
+  var adBlockClickHandler = null;
+  var uiToggleClickHandler = null;
+  var readerEatClickHandler = null;
+  var autoScrollTouchStartHandler = null;
+  var autoScrollTouchMoveHandler = null;
+  var autoScrollTouchEndHandler = null;
+  var autoScrollTouchCancelHandler = null;
+  var pendingNextChapter = null;
+  var _origPushState = history.pushState,
+    _origReplaceState = history.replaceState;
+
+  function isValidMangaUrl(url) {
+    for (let i = 0; i < SITES.length; i++) {
+      if (SITES[i].domain.test(url)) return true;
     }
-    const NEXT_LINK_SELECTORS = "a[class*='next'], a[href*='proximo'], a[href*='próximo'], .page-next, a[title*='próximo'], a[aria-label*='next'], .next-chapter, .proximo";
-    const AUTO_SCROLL_SPEEDS = [1.9, 3.4];
-    const SCROLL_THRESHOLD = 10000;
-    const SCROLL_INTERVAL = 16;
-    const DOUBLE_TAP_DELAY = 300;
-    const FETCH_TIMEOUT = 10000;
-    const SAVE_DEBOUNCE_DELAY = 500;
-    const MAX_LIBRARY_SIZE = 100;
-    const VALID_DOMAIN_REGEX = /^https?:\/\/(mangalivre\.tv|mangalivre\.to)/;
+    return false;
+  }
 
-    let isZenModeActive = false;
-    let isChapterLoading = false;
-    let currentFetchPromise = null;
-    let nextChapterHref = null;
-    let isUiVisible = true;
-    let currentTitle = "";
-    let urlObserver = null;
-    let domMutationObserver = null;
-    let lastPersistedChapter = null;
-    let isAutoScrollEnabled = false;
-    let autoScrollSpeedIndex = 1;
-    let lastTapTimestamp = 0;
-    let tapCount = 0;
-    let touchStartY = 0;
-    let touchMoved = false;
-    let onScrollHandler = null;
-    let onWheelHandler = null;
-    let onBeforeUnloadHandler = null;
-    let autoScrollAnimationFrameId = null;
-    let statusHud = null;
-    let loaderBar = null;
-    let autoScrollButton = null;
-    let saveDebounceTimeout = null;
-    let doubleTapTimer = null;
-    let loaderHideTimeout = null;
-    let lazyLoadIntersectionObserver = null;
-    let onModalClose = null;
-
-    function escapeHtml(str) {
-        return str.replace(/[<>"'&`]/g, (match) => ({
-            '<': '&lt;',
-            '>': '&gt;',
-            '"': '&quot;',
-            "'": '&#39;',
-            '&': '&amp;',
-            '`': '&#96;'
-        }[match]));
+  function detectSite() {
+    var url = window.location.href;
+    for (let i = 0; i < SITES.length; i++) {
+      if (SITES[i].domain.test(url)) return SITES[i];
     }
+    return null;
+  }
 
-    function isValidMangaUrl(url) {
-        return url && VALID_DOMAIN_REGEX.test(url);
-    }
-
-    const styleElement = document.createElement('style');
-    styleElement.id = 'mangalivre-custom-styles';
-    styleElement.textContent = `
+  const styleElement = document.createElement("style");
+  styleElement.id = "mangalivre-custom-styles";
+  styleElement.textContent = `
         img[data-src] {
             background: linear-gradient(90deg, #111 25%, #1a1a1a 50%, #111 75%);
             background-size: 200% 100%;
@@ -175,8 +366,6 @@
 
         #manga-loader { position: fixed; top: 0; left: 0; height: 2px; background: transparent; width: 0%; transition: width 0.2s; z-index: 10003; }
 
-
-
         .manga-chapter-wrapper {
             width: 100%;
             display: flex;
@@ -234,821 +423,1113 @@
         }
     `;
 
-    const linkElement = document.createElement('link');
-    linkElement.rel = 'stylesheet';
-    linkElement.href = 'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css';
-    linkElement.id = 'mangalivre-fontawesome';
+  const linkElement = document.createElement("link");
+  linkElement.rel = "stylesheet";
+  linkElement.href =
+    "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css";
+  linkElement.id = "mangalivre-fontawesome";
 
-    function injectStylesToHead() {
-        if (!document.getElementById('mangalivre-fontawesome')) {
-            document.head.appendChild(linkElement);
-        }
-        if (!document.getElementById('mangalivre-custom-styles')) {
-            document.head.appendChild(styleElement);
-        }
+  function injectStylesToHead() {
+    if (!document.getElementById("mangalivre-fontawesome")) {
+      document.head.appendChild(linkElement);
     }
-
-    function initLazyLoadObserver() {
-        if ('IntersectionObserver' in window && !lazyLoadIntersectionObserver) {
-            lazyLoadIntersectionObserver = new IntersectionObserver((entries) => {
-                entries.forEach(entry => {
-                    if (entry.isIntersecting) {
-                        const img = entry.target;
-                        const src = img.dataset.src;
-                        if (src) {
-                            img.src = src;
-                            img.removeAttribute('data-src');
-                            lazyLoadIntersectionObserver.unobserve(img);
-                        }
-                    }
-                });
-            }, {
-                rootMargin: '500px'
-            });
-        }
+    if (!document.getElementById("mangalivre-custom-styles")) {
+      document.head.appendChild(styleElement);
     }
+  }
 
-    injectStylesToHead();
-    createLibraryButton();
-
-    function getLibrary() {
-        try {
-            const lib = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-            const validLib = {};
-            Object.keys(lib).forEach(key => {
-                const item = lib[key];
-                if (item.title) item.title = escapeHtml(item.title);
-                if (item.lastChapter) item.lastChapter = escapeHtml(String(item.lastChapter));
-                if (item.lastUrl && isValidMangaUrl(item.lastUrl)) {
-                    validLib[key] = item;
-                }
-            });
-            return validLib;
-        } catch (e) {
-            console.error('Erro ao carregar biblioteca:', e);
-            return {};
-        }
-    }
-
-    function saveLibraryToStorage(lib) {
-        try {
-            const sortedByTime = Object.entries(lib).sort((a, b) => b[1].timestamp - a[1].timestamp);
-            if (sortedByTime.length > MAX_LIBRARY_SIZE) {
-                const trimmedLib = {};
-                sortedByTime.slice(0, MAX_LIBRARY_SIZE).forEach(([slug, data]) => {
-                    trimmedLib[slug] = data;
-                });
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmedLib));
-            } else {
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(lib));
+  function initLazyLoadObserver() {
+    if ("IntersectionObserver" in window && !lazyLoadIntersectionObserver) {
+      console.log(
+        "[TL] initLazyLoadObserver — criando observer com rootMargin 500px",
+      );
+      lazyLoadIntersectionObserver = new IntersectionObserver(
+        function (entries) {
+          entries.forEach(function (entry) {
+            if (entry.isIntersecting) {
+              var img = entry.target;
+              var src = img.dataset.src;
+              if (src) {
+                img.src = src;
+                img.removeAttribute("data-src");
+                lazyLoadIntersectionObserver.unobserve(img);
+              }
             }
-            return true;
-        } catch (e) {
-            console.error('Erro ao salvar no localStorage:', e);
-            return false;
-        }
+          });
+        },
+        { rootMargin: "500px" },
+      );
     }
+  }
 
-    function saveReadingProgress(url, chapterNum) {
-        if (!currentTitle || !url || !chapterNum) return;
-        clearTimeout(saveDebounceTimeout);
-        saveDebounceTimeout = setTimeout(() => {
-            try {
-                let sanitizedTitle = escapeHtml(currentTitle.trim());
-                sanitizedTitle = sanitizedTitle.substring(0, 200);
-                const sanitizedChapter = escapeHtml(String(chapterNum)).substring(0, 50);
-                const slug = sanitizedTitle.toLowerCase().replace(/\s+/g, '-').replace(/[^\w\-]+/g, '');
-                const lib = getLibrary();
-                lib[slug] = {
-                    slug: slug,
-                    lastChapter: sanitizedChapter,
-                    lastUrl: url,
-                    title: sanitizedTitle,
-                    timestamp: Date.now()
-                };
-                saveLibraryToStorage(lib);
-            } catch (e) {
-                console.error('Erro ao salvar progresso:', e);
-            }
-        }, SAVE_DEBOUNCE_DELAY);
+  var allowedDomains = [
+    "toonlivre.net",
+    "cdnjs.cloudflare.com",
+    "fonts.googleapis.com",
+    "fonts.gstatic.com",
+  ];
+  function isAllowed(url) {
+    try {
+      var host = new URL(url, location.href).hostname;
+      return allowedDomains.some(function (d) {
+        return host === d || host.endsWith("." + d);
+      });
+    } catch (e) {
+      return false;
     }
+  }
 
-    function createReaderUI() {
-        statusHud = document.createElement('div');
-        statusHud.id = 'manga-hud';
-        statusHud.textContent = 'Carregando...';
-        document.body.appendChild(statusHud);
-
-        loaderBar = document.createElement('div');
-        loaderBar.id = 'manga-loader';
-        document.body.appendChild(loaderBar);
-
-        autoScrollButton = document.createElement('div');
-        autoScrollButton.className = 'manga-fab-btn';
-        autoScrollButton.id = 'manga-autoscroll-btn';
-        autoScrollButton.addEventListener('click', (e) => {
-            e.stopPropagation();
-            toggleAutoScroll();
-        });
-        autoScrollButton.addEventListener('contextmenu', (e) => {
+  var _adBlockersApplied = false;
+  function applyAdBlockers() {
+    if (_adBlockersApplied) return;
+    _adBlockersApplied = true;
+    const origFetch = window.fetch;
+    window.fetch = function (url, opts) {
+      var u = typeof url === "string" ? url : url && url.url ? url.url : "";
+      if (u.includes("/api/pub") || (u && !isAllowed(u))) {
+        console.log("[TL] blocked fetch:", u);
+        return Promise.resolve(new Response("{}", { status: 204 }));
+      }
+      return origFetch.call(window, url, opts);
+    };
+    const origXhrOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function () {
+      if (
+        arguments[1] &&
+        typeof arguments[1] === "string" &&
+        !isAllowed(arguments[1])
+      ) {
+        console.log("[TL] blocked XHR:", arguments[1]);
+        arguments[1] = "about:blank";
+      }
+      return origXhrOpen.apply(this, arguments);
+    };
+    const origSendBeacon = navigator.sendBeacon;
+    navigator.sendBeacon = function (url, data) {
+      if (url && typeof url === "string" && !isAllowed(url)) {
+        console.log("[TL] blocked beacon:", url);
+        return false;
+      }
+      return origSendBeacon.call(this, url, data);
+    };
+    window.open = function () {
+      return null;
+    };
+    Array.from(document.querySelectorAll(AD_SELECTOR)).forEach(function (el) {
+      el.remove();
+    });
+    document.addEventListener(
+      "click",
+      (adBlockClickHandler = function (e) {
+        var t = e.target;
+        for (let i = 0; i < 10 && t; i++) {
+          if (t.tagName === "A" && t.href && !isAllowed(t.href)) {
             e.preventDefault();
             e.stopPropagation();
-            cycleAutoScrollSpeed();
+            break;
+          }
+          t = t.parentElement;
+        }
+      }),
+      true,
+    );
+    adCleaner = new MutationObserver(function (muts) {
+      muts.forEach(function (m) {
+        m.addedNodes.forEach(function (n) {
+          if (n.nodeType === 1) {
+            var el = n;
+            if (el.matches && el.matches(AD_SELECTOR)) {
+              el.remove();
+            }
+            if (el.querySelectorAll) {
+              Array.from(el.querySelectorAll(AD_SELECTOR)).forEach(
+                function (sub) {
+                  sub.remove();
+                },
+              );
+            }
+          }
         });
-        autoScrollButton.addEventListener('touchstart', handleAutoScrollTouchStart, { passive: true });
-        autoScrollButton.addEventListener('touchmove', handleAutoScrollTouchMove, { passive: true });
-        autoScrollButton.addEventListener('touchend', handleAutoScrollTouchEnd);
-        autoScrollButton.addEventListener('touchcancel', handleAutoScrollTouchCancel);
-        document.body.appendChild(autoScrollButton);
-        updateAutoScrollButtonIcon();
+      });
+    });
+    adCleaner.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
+  }
 
-        const exitBtn = document.createElement('div');
-        exitBtn.className = 'manga-fab-btn';
-        exitBtn.id = 'manga-exit-btn';
-        const exitIcon = document.createElement('i');
-        exitIcon.className = 'fas fa-arrow-left';
-        exitBtn.appendChild(exitIcon);
-        exitBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const currentUrl = window.location.href;
-            let seriesUrl = window.origin;
-            if (currentUrl.includes('/manga/') || currentUrl.includes('/ler/')) {
-                const parts = currentUrl.split('/');
-                seriesUrl = parts.slice(0, 5).join('/');
-            }
-            window.location.href = seriesUrl;
+  applyAdBlockers();
+  injectStylesToHead();
+  if (document.body) createLibraryButton();
+
+  function getLibrary() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      const lib = JSON.parse(raw || "{}");
+      const validLib = {};
+      Object.keys(lib).forEach(function (key) {
+        const item = lib[key];
+        if (item.lastUrl && isValidMangaUrl(item.lastUrl)) {
+          validLib[key] = item;
+        }
+      });
+      console.log("[TL] getLibrary:", Object.keys(validLib).length, "entries");
+      return validLib;
+    } catch (e) {
+      console.error("[TL] erro ao carregar biblioteca:", e);
+      return {};
+    }
+  }
+
+  function saveLibraryToStorage(lib) {
+    try {
+      const entries = Object.entries(lib).sort(function (a, b) {
+        return b[1].timestamp - a[1].timestamp;
+      });
+      if (entries.length > MAX_LIBRARY_SIZE) {
+        const trimmedLib = {};
+        entries.slice(0, MAX_LIBRARY_SIZE).forEach(function (entry) {
+          trimmedLib[entry[0]] = entry[1];
         });
-        document.body.appendChild(exitBtn);
-
-        document.addEventListener('click', (e) => {
-            if (e.target.closest('#manga-lib-modal') || e.target.closest('.manga-fab-btn')) return;
-            toggleReaderUI();
-        });
-
-        return { hud: statusHud };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmedLib));
+        console.log("[TL] saveLibrary: trimmed to", MAX_LIBRARY_SIZE);
+      } else {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(lib));
+        console.log("[TL] saveLibrary:", entries.length, "entries");
+      }
+      return true;
+    } catch (e) {
+      console.error("[TL] erro ao salvar localStorage:", e);
+      return false;
     }
+  }
 
-    function toggleReaderUI() {
-        isUiVisible = !isUiVisible;
-        const els = document.querySelectorAll('.manga-fab-btn, #manga-hud');
-        els.forEach(el => el.classList.toggle('manga-fab-hidden', !isUiVisible));
+  function saveReadingProgress(url, chapterNum) {
+    if (!currentTitle || !url || !chapterNum) {
+      console.log("[TL] saveReadingProgress skipped: missing data", {
+        t: !!currentTitle,
+        u: !!url,
+        c: !!chapterNum,
+      });
+      return;
     }
-
-    function cycleAutoScrollSpeed() {
-        autoScrollSpeedIndex = (autoScrollSpeedIndex + 1) % AUTO_SCROLL_SPEEDS.length;
-        updateAutoScrollButtonIcon();
-    }
-
-    function toggleAutoScroll() {
-        isAutoScrollEnabled = !isAutoScrollEnabled;
-        if (isAutoScrollEnabled) {
-            startAutoScrollLoop();
-        } else {
-            if (autoScrollAnimationFrameId) {
-                cancelAnimationFrame(autoScrollAnimationFrameId);
-                autoScrollAnimationFrameId = null;
-            }
+    clearTimeout(saveDebounceTimeout);
+    saveDebounceTimeout = setTimeout(function () {
+      try {
+        var sanitizedTitle = currentTitle.trim().substring(0, 200);
+        var sanitizedChapter = String(chapterNum).substring(0, 50);
+        var slug = currentTitle
+          .trim()
+          .toLowerCase()
+          .replace(/\s+/g, "-")
+          .replace(/[^\w\-]+/g, "");
+        console.log(
+          "[TL] saving progress:",
+          sanitizedTitle,
+          "cap",
+          sanitizedChapter,
+        );
+        var lib = getLibrary();
+        if (
+          Object.keys(lib).length === 0 &&
+          localStorage.getItem(STORAGE_KEY)
+        ) {
+          console.warn(
+            "[TL] getLibrary returned empty but localStorage has data — aborting save to prevent data loss",
+          );
+          return;
         }
-        updateAutoScrollButtonIcon();
-    }
-
-    function handleAutoScrollTouchStart(e) {
-        touchStartY = e.touches[0].clientY;
-        touchMoved = false;
-    }
-
-    function handleAutoScrollTouchMove(e) {
-        const touchY = e.touches[0].clientY;
-        if (Math.abs(touchY - touchStartY) > 10) {
-            touchMoved = true;
-        }
-    }
-
-    function handleAutoScrollTouchEnd(e) {
-        if (touchMoved) return;
-
-        e.preventDefault();
-        e.stopPropagation();
-
-        const currentTime = Date.now();
-        const timeDiff = currentTime - lastTapTimestamp;
-
-        clearTimeout(doubleTapTimer);
-
-        if (timeDiff < DOUBLE_TAP_DELAY && tapCount === 1) {
-            cycleAutoScrollSpeed();
-            tapCount = 0;
-        } else {
-            tapCount = 1;
-            doubleTapTimer = setTimeout(() => {
-                if (tapCount === 1) {
-                    toggleAutoScroll();
-                }
-                tapCount = 0;
-            }, DOUBLE_TAP_DELAY);
-        }
-        lastTapTimestamp = currentTime;
-    }
-
-    function handleAutoScrollTouchCancel() {
-        touchMoved = false;
-        tapCount = 0;
-        clearTimeout(doubleTapTimer);
-    }
-
-    function updateAutoScrollButtonIcon() {
-        if (!autoScrollButton) return;
-
-        const icon = document.createElement('i');
-        icon.className = 'fas';
-
-        if (!isAutoScrollEnabled) {
-            icon.classList.add('fa-play');
-        } else if (autoScrollSpeedIndex === 0) {
-            icon.classList.add('fa-angle-down');
-        } else {
-            icon.classList.add('fa-angle-double-down');
-        }
-
-        autoScrollButton.textContent = '';
-        autoScrollButton.appendChild(icon);
-    }
-
-    function startAutoScrollLoop() {
-        if (autoScrollAnimationFrameId) {
-            cancelAnimationFrame(autoScrollAnimationFrameId);
-        }
-        if (!isAutoScrollEnabled) return;
-
-        let lastTime = 0;
-        const scrollStep = () => {
-            const now = Date.now();
-            if (now - lastTime >= SCROLL_INTERVAL) {
-                window.scrollBy(0, AUTO_SCROLL_SPEEDS[autoScrollSpeedIndex]);
-                lastTime = now;
-            }
-            if (isAutoScrollEnabled) {
-                autoScrollAnimationFrameId = requestAnimationFrame(scrollStep);
-            }
+        lib[slug] = {
+          slug: slug,
+          lastChapter: sanitizedChapter,
+          lastUrl: url,
+          title: sanitizedTitle,
+          timestamp: Date.now(),
         };
+        console.log(
+          "[TL] salvando biblioteca — slug:",
+          slug,
+          "cap:",
+          sanitizedChapter,
+        );
+        saveLibraryToStorage(lib);
+      } catch (e) {
+        console.error("[TL] erro ao salvar progresso:", e);
+      }
+    }, SAVE_DEBOUNCE_DELAY);
+  }
+
+  function createReaderUI() {
+    console.log("[TL] createReaderUI — criando HUD, loader, botoes");
+    statusHud = document.createElement("div");
+    statusHud.id = "manga-hud";
+    statusHud.textContent = "Carregando...";
+    document.body.appendChild(statusHud);
+
+    loaderBar = document.createElement("div");
+    loaderBar.id = "manga-loader";
+    document.body.appendChild(loaderBar);
+
+    autoScrollButton = document.createElement("div");
+    autoScrollButton.className = "manga-fab-btn";
+    autoScrollButton.id = "manga-autoscroll-btn";
+    autoScrollButton.addEventListener("click", function (e) {
+      e.stopPropagation();
+      toggleAutoScroll();
+    });
+    autoScrollButton.addEventListener("contextmenu", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      cycleAutoScrollSpeed();
+    });
+    autoScrollButton.addEventListener(
+      "touchstart",
+      (autoScrollTouchStartHandler = handleAutoScrollTouchStart),
+      { passive: true },
+    );
+    autoScrollButton.addEventListener(
+      "touchmove",
+      (autoScrollTouchMoveHandler = handleAutoScrollTouchMove),
+      { passive: true },
+    );
+    autoScrollButton.addEventListener(
+      "touchend",
+      (autoScrollTouchEndHandler = handleAutoScrollTouchEnd),
+    );
+    autoScrollButton.addEventListener(
+      "touchcancel",
+      (autoScrollTouchCancelHandler = handleAutoScrollTouchCancel),
+    );
+    document.body.appendChild(autoScrollButton);
+    updateAutoScrollButtonIcon();
+
+    var exitBtn = document.createElement("div");
+    exitBtn.className = "manga-fab-btn";
+    exitBtn.id = "manga-exit-btn";
+    var exitIcon = document.createElement("i");
+    exitIcon.className = "fas fa-arrow-left";
+    exitBtn.appendChild(exitIcon);
+    exitBtn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      var currentUrl = window.location.href;
+      var seriesUrl = window.location.origin;
+      try {
+        var parsed = new URL(currentUrl);
+        var pathParts = parsed.pathname.split("/").filter(Boolean);
+        seriesUrl = parsed.origin + "/" + pathParts[0];
+      } catch(e) {
+        seriesUrl = window.location.origin;
+      }
+      console.log("[TL] exit — navegando para", seriesUrl);
+      window.location.href = seriesUrl;
+    });
+    document.body.appendChild(exitBtn);
+
+    document.addEventListener(
+      "click",
+      (uiToggleClickHandler = function (e) {
+        if (
+          e.target.closest("#manga-lib-modal") ||
+          e.target.closest(".manga-fab-btn")
+        )
+          return;
+        console.log("[TL] toggle UI visibility");
+        toggleReaderUI();
+      }),
+    );
+
+    console.log("[TL] createReaderUI completo");
+    return { hud: statusHud };
+  }
+
+  function toggleReaderUI() {
+    isUiVisible = !isUiVisible;
+    console.log(
+      "[TL] toggleReaderUI — agora",
+      isUiVisible ? "visivel" : "oculto",
+    );
+    var els = document.querySelectorAll(".manga-fab-btn, #manga-hud");
+    Array.from(els).forEach(function (el) {
+      return el.classList.toggle("manga-fab-hidden", !isUiVisible);
+    });
+  }
+
+  function cycleAutoScrollSpeed() {
+    autoScrollSpeedIndex =
+      (autoScrollSpeedIndex + 1) % AUTO_SCROLL_SPEEDS.length;
+    console.log(
+      "[TL] cycleAutoScrollSpeed — velocidade",
+      AUTO_SCROLL_SPEEDS[autoScrollSpeedIndex],
+    );
+    updateAutoScrollButtonIcon();
+  }
+
+  function toggleAutoScroll() {
+    isAutoScrollEnabled = !isAutoScrollEnabled;
+    console.log(
+      "[TL] toggleAutoScroll —",
+      isAutoScrollEnabled ? "ligado" : "desligado",
+    );
+    if (isAutoScrollEnabled) {
+      startAutoScrollLoop();
+    } else {
+      if (autoScrollAnimationFrameId) {
+        cancelAnimationFrame(autoScrollAnimationFrameId);
+        autoScrollAnimationFrameId = null;
+      }
+    }
+    updateAutoScrollButtonIcon();
+  }
+
+  function handleAutoScrollTouchStart(e) {
+    console.log("[TL] touchStart no autoScroll");
+    touchStartY = e.touches[0].clientY;
+    touchMoved = false;
+  }
+
+  function handleAutoScrollTouchMove(e) {
+    var touchY = e.touches[0].clientY;
+    if (Math.abs(touchY - touchStartY) > 10) {
+      touchMoved = true;
+      console.log("[TL] touchMove — movimento detectado, cancelando tap");
+    }
+  }
+
+  function handleAutoScrollTouchEnd(e) {
+    if (touchMoved) {
+      console.log("[TL] touchMove detectado, ignorando tap");
+      return;
+    }
+    console.log(
+      "[TL] touchEnd — tap no autoScroll, timeDiff:",
+      Date.now() - lastTapTimestamp,
+      "tapCount:",
+      tapCount,
+    );
+    e.preventDefault();
+    e.stopPropagation();
+    var currentTime = Date.now();
+    var timeDiff = currentTime - lastTapTimestamp;
+    clearTimeout(doubleTapTimer);
+    if (timeDiff < DOUBLE_TAP_DELAY && tapCount === 1) {
+      cycleAutoScrollSpeed();
+      tapCount = 0;
+    } else {
+      tapCount = 1;
+      doubleTapTimer = setTimeout(function () {
+        if (tapCount === 1) toggleAutoScroll();
+        tapCount = 0;
+      }, DOUBLE_TAP_DELAY);
+    }
+    lastTapTimestamp = currentTime;
+  }
+
+  function handleAutoScrollTouchCancel() {
+    touchMoved = false;
+    tapCount = 0;
+    clearTimeout(doubleTapTimer);
+  }
+
+  function updateAutoScrollButtonIcon() {
+    if (!autoScrollButton) return;
+    var icon = document.createElement("i");
+    icon.className = "fas";
+    if (!isAutoScrollEnabled) {
+      icon.classList.add("fa-play");
+    } else if (autoScrollSpeedIndex === 0) {
+      icon.classList.add("fa-angle-down");
+    } else {
+      icon.classList.add("fa-angle-double-down");
+    }
+    autoScrollButton.replaceChildren(icon);
+  }
+
+  function startAutoScrollLoop() {
+    if (autoScrollAnimationFrameId)
+      cancelAnimationFrame(autoScrollAnimationFrameId);
+    if (!isAutoScrollEnabled) return;
+    var lastTime = 0;
+    function scrollStep() {
+      var now = Date.now();
+      if (now - lastTime >= SCROLL_INTERVAL) {
+        window.scrollBy(0, AUTO_SCROLL_SPEEDS[autoScrollSpeedIndex]);
+        lastTime = now;
+      }
+      if (isAutoScrollEnabled)
         autoScrollAnimationFrameId = requestAnimationFrame(scrollStep);
     }
+    autoScrollAnimationFrameId = requestAnimationFrame(scrollStep);
+  }
 
-    function getMostVisibleChapterWrapper(wrappers) {
-        let mostVisibleWrapper = null;
-        let maxVisibility = 0;
-        let mostVisibleCap = null;
-        let mostVisibleUrl = null;
+  function getMostVisibleChapterWrapper(wrappers) {
+    var mostVisibleWrapper = null;
+    var maxVisibility = 0;
+    var mostVisibleCap = null;
+    var mostVisibleUrl = null;
+    wrappers.forEach(function (wrapper) {
+      var rect = wrapper.getBoundingClientRect();
+      var windowHeight = window.innerHeight;
+      if (rect.bottom < 0 || rect.top > windowHeight) return;
+      var visibleTop = Math.max(0, rect.top);
+      var visibleBottom = Math.min(windowHeight, rect.bottom);
+      var visibleHeight = Math.max(0, visibleBottom - visibleTop);
+      if (rect.height <= 0) return;
+      var visibility = visibleHeight / rect.height;
+      if (visibility > maxVisibility) {
+        maxVisibility = visibility;
+        mostVisibleWrapper = wrapper;
+        mostVisibleCap = wrapper.getAttribute("data-cap");
+        mostVisibleUrl = wrapper.getAttribute("data-url");
+      }
+    });
+    return {
+      wrapper: mostVisibleWrapper,
+      cap: mostVisibleCap,
+      url: mostVisibleUrl,
+    };
+  }
 
-        wrappers.forEach(wrapper => {
-            const rect = wrapper.getBoundingClientRect();
-            const windowHeight = window.innerHeight;
+  function updateUIOnScroll() {
+    var wrappers = Array.from(
+      document.querySelectorAll(".manga-chapter-wrapper"),
+    ).filter(function (w) {
+      return !w.querySelector(".manga-end-message");
+    });
+    if (wrappers.length === 0) return;
+    var result = getMostVisibleChapterWrapper(wrappers);
+    if (!result.wrapper) return;
+    if (statusHud && result.cap)
+      statusHud.textContent = "Capítulo " + result.cap;
+    if (result.cap && result.cap !== lastPersistedChapter) {
+      saveReadingProgress(result.url, result.cap);
+      lastPersistedChapter = result.cap;
+    }
+  }
 
-            if (rect.bottom < 0 || rect.top > windowHeight) {
-                return;
+  function initVisibilityObserver() {
+    console.log(
+      "[TL] initVisibilityObserver — criando urlObserver com threshold 0.05",
+    );
+    urlObserver = new IntersectionObserver(
+      function (entries) {
+        entries.forEach(function (entry) {
+          if (entry.isIntersecting) {
+            var cap = entry.target.getAttribute("data-cap");
+            var url = entry.target.getAttribute("data-url");
+              if (cap && url) {
+              _origReplaceState.call(window.history, {}, "", url);
             }
-
-            const visibleTop = Math.max(0, rect.top);
-            const visibleBottom = Math.min(windowHeight, rect.bottom);
-            const visibleHeight = Math.max(0, visibleBottom - visibleTop);
-            const visibility = visibleHeight / rect.height;
-
-            if (visibility > maxVisibility) {
-                maxVisibility = visibility;
-                mostVisibleWrapper = wrapper;
-                mostVisibleCap = wrapper.getAttribute('data-cap');
-                mostVisibleUrl = wrapper.getAttribute('data-url');
-            }
+          }
         });
+      },
+      { threshold: 0.05, rootMargin: "0px 0px -50% 0px" },
+    );
+  }
 
-        return { wrapper: mostVisibleWrapper, cap: mostVisibleCap, url: mostVisibleUrl };
+  function cleanupListeners() {
+    isAutoScrollEnabled = false;
+    if (autoScrollAnimationFrameId) {
+      cancelAnimationFrame(autoScrollAnimationFrameId);
+      autoScrollAnimationFrameId = null;
+    }
+    if (urlObserver) {
+      urlObserver.disconnect();
+      urlObserver = null;
+    }
+    if (lazyLoadIntersectionObserver) {
+      lazyLoadIntersectionObserver.disconnect();
+      lazyLoadIntersectionObserver = null;
+    }
+    if (adCleaner) {
+      adCleaner.disconnect();
+      adCleaner = null;
+    }
+    if (adBlockClickHandler) {
+      document.removeEventListener("click", adBlockClickHandler, true);
+      adBlockClickHandler = null;
+    }
+    _adBlockersApplied = false;
+    if (uiToggleClickHandler) {
+      document.removeEventListener("click", uiToggleClickHandler);
+      uiToggleClickHandler = null;
+    }
+    if (readerEatClickHandler) {
+      document.removeEventListener("click", readerEatClickHandler, true);
+      readerEatClickHandler = null;
+    }
+    if (autoScrollTouchStartHandler) {
+      autoScrollButton &&
+        autoScrollButton.removeEventListener(
+          "touchstart",
+          autoScrollTouchStartHandler,
+        );
+      autoScrollTouchStartHandler = null;
+    }
+    if (autoScrollTouchMoveHandler) {
+      autoScrollButton &&
+        autoScrollButton.removeEventListener(
+          "touchmove",
+          autoScrollTouchMoveHandler,
+        );
+      autoScrollTouchMoveHandler = null;
+    }
+    if (autoScrollTouchEndHandler) {
+      autoScrollButton &&
+        autoScrollButton.removeEventListener(
+          "touchend",
+          autoScrollTouchEndHandler,
+        );
+      autoScrollTouchEndHandler = null;
+    }
+    if (autoScrollTouchCancelHandler) {
+      autoScrollButton &&
+        autoScrollButton.removeEventListener(
+          "touchcancel",
+          autoScrollTouchCancelHandler,
+        );
+      autoScrollTouchCancelHandler = null;
+    }
+    if (onScrollHandler) {
+      window.removeEventListener("scroll", onScrollHandler);
+      onScrollHandler = null;
+    }
+    if (onWheelHandler) {
+      window.removeEventListener("wheel", onWheelHandler);
+      onWheelHandler = null;
+    }
+    if (onBeforeUnloadHandler) {
+      window.removeEventListener("beforeunload", onBeforeUnloadHandler);
+      onBeforeUnloadHandler = null;
+    }
+    if (onModalClose) {
+      document.removeEventListener("click", onModalClose);
+      onModalClose = null;
+    }
+    var modal = document.getElementById("manga-lib-modal");
+    if (modal) modal.remove();
+    if (saveDebounceTimeout) {
+      clearTimeout(saveDebounceTimeout);
+      saveDebounceTimeout = null;
+    }
+    if (doubleTapTimer) {
+      clearTimeout(doubleTapTimer);
+      doubleTapTimer = null;
+    }
+    if (loaderHideTimeout) {
+      clearTimeout(loaderHideTimeout);
+      loaderHideTimeout = null;
+    }
+  }
+
+  function getCurrentChapterData() {
+    currentTitle = activeSite.getTitle();
+    var currentUrl = window.location.href;
+    var capNum = activeSite.getChapterNumber();
+    lastPersistedChapter = null;
+    return {
+      currentCap: capNum || "Inicial",
+      currentUrl: currentUrl,
+      currentImages: [],
+    };
+  }
+
+  function setupEventHandlers(mainContainer) {
+    onScrollHandler = function () {
+      var nearBottom =
+        window.innerHeight + window.scrollY >=
+        document.body.offsetHeight - SCROLL_THRESHOLD;
+      if (nearBottom)
+        console.log(
+          "[TL] scroll near bottom, pendingNext:",
+          !!pendingNextChapter,
+          "loading:",
+          isChapterLoading,
+        );
+      if (!isChapterLoading && pendingNextChapter) {
+        if (nearBottom) {
+          console.log("[TL] triggering fetchAndAppendNextChapter");
+          fetchAndAppendNextChapter(mainContainer);
+        }
+      }
+      updateUIOnScroll();
+    };
+    console.log(
+      "[TL] setupEventHandlers — registrando scroll, wheel, beforeunload, click",
+    );
+    window.addEventListener("scroll", onScrollHandler, { passive: true });
+
+    var lastScrollY = window.scrollY;
+    onWheelHandler = function (e) {
+      if (isAutoScrollEnabled) {
+        console.log("[TL] wheel detectado durante autoScroll — desligando");
+        var currentScrollY = window.scrollY;
+        if (Math.abs(currentScrollY - lastScrollY) > 30) toggleAutoScroll();
+        lastScrollY = currentScrollY;
+      }
+    };
+    window.addEventListener("wheel", onWheelHandler, { passive: true });
+
+    onBeforeUnloadHandler = function () {
+      console.log("[TL] beforeunload — limpando listeners");
+      cleanupListeners();
+    };
+    window.addEventListener("beforeunload", onBeforeUnloadHandler);
+  }
+
+  function onReaderClick(e) {
+    var our = e.target.closest(
+      ".manga-fab-btn, #manga-hud, #manga-lib-modal, #manga-loader, .manga-container, .manga-chapter-wrapper, .manga-chapter-divider, .manga-end-message",
+    );
+    if (!our) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }
+
+  function rebuildReaderPage() {
+    console.log("[TL] rebuildReaderPage — limpando DOM e reconstruindo");
+    document.body.replaceChildren();
+    document.head.insertAdjacentHTML(
+      "afterbegin",
+      '<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">',
+    );
+    injectStylesToHead();
+    applyAdBlockers();
+    document.addEventListener(
+      "click",
+      (readerEatClickHandler = onReaderClick),
+      true,
+    );
+    console.log("[TL] rebuildReaderPage — criando UI");
+    var ui = createReaderUI();
+    var mainContainer = document.createElement("div");
+    mainContainer.className = "manga-container";
+    document.body.appendChild(mainContainer);
+    createLibraryButton();
+    console.log("[TL] rebuildReaderPage completo");
+    return { hud: ui.hud, mainContainer: mainContainer };
+  }
+
+  function renderChapterSection(container, images, capNum, url) {
+    console.log(
+      "[TL] renderChapterSection cap:",
+      capNum,
+      "pages:",
+      images.length,
+    );
+    var wrapper = document.createElement("div");
+    wrapper.className = "manga-chapter-wrapper";
+    wrapper.setAttribute("data-cap", capNum);
+    wrapper.setAttribute("data-url", url);
+
+    if (capNum !== "Inicial") {
+      var divider = document.createElement("div");
+      divider.className = "manga-chapter-divider";
+      divider.textContent = "Capítulo " + capNum;
+      wrapper.appendChild(divider);
     }
 
-    function updateUIOnScroll() {
-        const wrappers = Array.from(document.querySelectorAll('.manga-chapter-wrapper')).filter(w => !w.querySelector('.manga-end-message'));
-        if (wrappers.length === 0) return;
-
-        const { wrapper: mostVisibleWrapper, cap: mostVisibleCap, url: mostVisibleUrl } = getMostVisibleChapterWrapper(wrappers);
-        if (!mostVisibleWrapper) return;
-
-        if (statusHud && mostVisibleCap) statusHud.textContent = `Capítulo ${mostVisibleCap}`;
-
-        if (mostVisibleCap && mostVisibleCap !== lastPersistedChapter) {
-            saveReadingProgress(mostVisibleUrl, mostVisibleCap);
-            lastPersistedChapter = mostVisibleCap;
-        }
+    if (!Array.isArray(images) || images.length === 0) {
+      console.warn("[TL] renderChapterSection: no images");
+      return;
     }
+    var frag = document.createDocumentFragment();
+    images.forEach(function (src, index) {
+      var img = document.createElement("img");
+      if (index < EAGER_LOAD_COUNT) {
+        img.src = src;
+      } else {
+        img.dataset.src = src;
+        img.src =
+          "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+        if (lazyLoadIntersectionObserver)
+          lazyLoadIntersectionObserver.observe(img);
+      }
+      img.onerror = function () {
+        this.style.display = "none";
+        console.error("Falha ao carregar imagem:", src);
+      };
+      frag.appendChild(img);
+    });
+    wrapper.appendChild(frag);
 
-    function initVisibilityObserver() {
-        urlObserver = new IntersectionObserver((entries) => {
-            entries.forEach(entry => {
-                if (entry.isIntersecting) {
-                    const cap = entry.target.getAttribute('data-cap');
-                    const url = entry.target.getAttribute('data-url');
-                    if (cap && url) {
-                        window.history.replaceState({}, '', url);
-                    }
-                }
-            });
-        }, { threshold: 0.05, rootMargin: "0px 0px -50% 0px" });
+    container.appendChild(wrapper);
+    console.log(
+      "[TL] capitulo",
+      capNum,
+      "renderizado com",
+      images.length,
+      "imagens",
+    );
+    if (urlObserver) urlObserver.observe(wrapper);
+  }
+
+  function showChapterError(container) {
+    var errorMsg = document.createElement("div");
+    errorMsg.className = "manga-end-message";
+    errorMsg.textContent =
+      "Não foi possível exibir o próximo capítulo. Verifique se a disponibilidade no site original sem o script.";
+    container.appendChild(errorMsg);
+  }
+
+  function fetchAndAppendNextChapter(container) {
+    console.log(
+      "[TL] fetchAndAppendNextChapter — loading:",
+      isChapterLoading,
+      "pendingNext:",
+      !!pendingNextChapter,
+    );
+    if (currentFetchPromise) {
+      console.log("[TL] fetch ja em andamento, retornando promise existente");
+      return currentFetchPromise;
     }
-
-    function cleanupListeners() {
-        isAutoScrollEnabled = false;
-
-        if (autoScrollAnimationFrameId) {
-            cancelAnimationFrame(autoScrollAnimationFrameId);
-            autoScrollAnimationFrameId = null;
-        }
-
-        if (urlObserver) {
-            urlObserver.disconnect();
-            urlObserver = null;
-        }
-
-        if (domMutationObserver) {
-            domMutationObserver.disconnect();
-            domMutationObserver = null;
-        }
-
-        if (lazyLoadIntersectionObserver) {
-            lazyLoadIntersectionObserver.disconnect();
-            lazyLoadIntersectionObserver = null;
-        }
-
-        if (onScrollHandler) {
-            window.removeEventListener('scroll', onScrollHandler);
-            onScrollHandler = null;
-        }
-
-        if (onWheelHandler) {
-            window.removeEventListener('wheel', onWheelHandler);
-            onWheelHandler = null;
-        }
-
-        if (onBeforeUnloadHandler) {
-            window.removeEventListener('beforeunload', onBeforeUnloadHandler);
-            onBeforeUnloadHandler = null;
-        }
-
-        if (onModalClose) {
-            document.removeEventListener('click', onModalClose);
-            onModalClose = null;
-        }
-
-        const modal = document.getElementById('manga-lib-modal');
-        if (modal) modal.remove();
-
-        if (saveDebounceTimeout) {
-            clearTimeout(saveDebounceTimeout);
-            saveDebounceTimeout = null;
-        }
-        if (doubleTapTimer) {
-            clearTimeout(doubleTapTimer);
-            doubleTapTimer = null;
-        }
-        if (loaderHideTimeout) {
-            clearTimeout(loaderHideTimeout);
-            loaderHideTimeout = null;
-        }
-
-    }
-
-    function getCurrentChapterData() {
-        let rawTitle = document.title.trim();
-        const split = rawTitle.split(/[-|]/);
-        currentTitle = split[0].trim();
-
-        const currentUrl = window.location.href;
-        const match = currentUrl.match(CHAPTER_REGEX);
-        const currentCap = match ? normalizeChapterNum(match[1]) : "Inicial";
-
-        lastPersistedChapter = null;
-
-        nextChapterHref = findNextChapterLink(document);
-        const currentImages = extractImageSources(document);
-
-        return { currentCap, currentUrl, currentImages };
-    }
-
-    function setupEventHandlers(mainContainer) {
-        onScrollHandler = () => {
-            if (!isChapterLoading && nextChapterHref) {
-                if ((window.innerHeight + window.scrollY) >= document.body.offsetHeight - SCROLL_THRESHOLD) {
-                    fetchAndAppendNextChapter(mainContainer);
-                }
-            }
-            updateUIOnScroll();
-        };
-        window.addEventListener('scroll', onScrollHandler, { passive: true });
-
-        let lastScrollY = window.scrollY;
-        onWheelHandler = (e) => {
-            if (isAutoScrollEnabled) {
-                const currentScrollY = window.scrollY;
-                if (e.deltaY < 0 && currentScrollY < lastScrollY - 50) {
-                    toggleAutoScroll();
-                }
-                lastScrollY = currentScrollY;
-            }
-        };
-        window.addEventListener('wheel', onWheelHandler, { passive: true });
-
-        onBeforeUnloadHandler = () => {
-            cleanupListeners();
-        };
-        window.addEventListener('beforeunload', onBeforeUnloadHandler);
-    }
-
-    function rebuildReaderPage() {
-        document.body.innerHTML = '';
-        document.head.innerHTML = '<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">';
-        injectStylesToHead();
-
-        const { hud } = createReaderUI();
-        const mainContainer = document.createElement('div');
-        mainContainer.className = 'manga-container';
-        document.body.appendChild(mainContainer);
-        createLibraryButton();
-        return { hud, mainContainer };
-    }
-
-    function initReaderMode() {
-        if (isZenModeActive) {
-            cleanupListeners();
-            isZenModeActive = false;
-        }
-
-        const isChapterPage = window.location.href.includes('capitulo') || window.location.href.includes('/ler/');
-
-        if (!isChapterPage) {
-            return;
-        }
-
-        const containers = document.querySelectorAll(IMAGE_SELECTORS);
-        if (containers.length === 0) {
-            console.warn('Script pausado: seletores de imagem não encontrados. Site pode ter mudado.');
-            return;
-        }
-
-        isZenModeActive = true;
-        initVisibilityObserver();
-        initLazyLoadObserver();
-
-        const { currentCap, currentUrl, currentImages } = getCurrentChapterData();
-
-        if (currentImages.length === 0) {
-            alert('Erro: Nenhuma imagem encontrada. Site pode ter mudado.');
-            return;
-        }
-
-        const { hud, mainContainer } = rebuildReaderPage();
-
-        renderChapterSection(mainContainer, currentImages, currentCap, currentUrl);
-
-        if (!nextChapterHref && !document.querySelector('.manga-end-message')) {
-            appendEndMessage(mainContainer);
-        }
-
-        setTimeout(() => {
-            if (hud) hud.textContent = `Capítulo ${currentCap}`;
-            updateUIOnScroll();
-        }, 500);
-
-        let mutationDebounce = null;
-        const observerConfig = { childList: true, subtree: true };
-        const mutationCallback = () => {
-            if (mutationDebounce) clearTimeout(mutationDebounce);
-            mutationDebounce = setTimeout(() => {
-                const found = findNextChapterLink(document);
-                if (found && found !== nextChapterHref) {
-                    nextChapterHref = found;
-                }
-            }, 120);
-        };
-        if (domMutationObserver) {
-            domMutationObserver.disconnect();
-            domMutationObserver = null;
-        }
-        domMutationObserver = new MutationObserver(mutationCallback);
-        domMutationObserver.observe(document.body, observerConfig);
-
-        setupEventHandlers(mainContainer);
-    }
-
-    function extractImageSources(doc) {
-        const containers = doc.querySelectorAll(IMAGE_SELECTORS);
-        let srcs = [];
-        containers.forEach(img => {
-            let src = img.getAttribute('data-lazy-src') || img.getAttribute('data-src') || img.getAttribute('src');
-            if (src && !src.includes('pixel') && !srcs.includes(src)) srcs.push(src);
-        });
-        return srcs;
-    }
-
-    function renderChapterSection(container, images, capNum, url) {
-        const wrapper = document.createElement('div');
-        wrapper.className = 'manga-chapter-wrapper';
-        wrapper.setAttribute('data-cap', capNum);
-        wrapper.setAttribute('data-url', url);
-
-        if (capNum !== "Inicial") {
-            const divider = document.createElement('div');
-            divider.className = 'manga-chapter-divider';
-            divider.textContent = `Capítulo ${capNum}`;
-            wrapper.appendChild(divider);
-        }
-
-        images.forEach((src, index) => {
-            const img = document.createElement('img');
-            if (index < 5) {
-                img.src = src;
-            } else {
-                img.dataset.src = src;
-                img.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
-                if (lazyLoadIntersectionObserver) {
-                    lazyLoadIntersectionObserver.observe(img);
-                }
-            }
-            img.onerror = function () {
-                this.style.display = 'none';
-                console.error('Falha ao carregar imagem:', src);
-            };
-            wrapper.appendChild(img);
-        });
-
-        container.appendChild(wrapper);
-        if (urlObserver) urlObserver.observe(wrapper);
-    }
-
-    function showChapterError(container) {
-        const errorMsg = document.createElement('div');
-        errorMsg.className = 'manga-end-message';
-        errorMsg.textContent = 'Não foi possível exibir o próximo capítulo. Verifique se a disponibilidade no site original sem o script.';
-        container.appendChild(errorMsg);
-    }
-
-    async function fetchAndAppendNextChapter(container) {
-        if (currentFetchPromise) return currentFetchPromise;
-        if (isChapterLoading || !nextChapterHref) return;
-
-        isChapterLoading = true;
-
-        currentFetchPromise = (async () => {
-            if (loaderBar) loaderBar.style.width = '70%';
-
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
-
-            let capNum = "?";
-            try {
-                const match = nextChapterHref.match(CHAPTER_REGEX);
-                capNum = match ? normalizeChapterNum(match[1]) : "?";
-
-                const response = await fetch(nextChapterHref, {
-                    signal: controller.signal,
-                    headers: {
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                        'Accept-Language': 'pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3'
-                    }
-                });
-                clearTimeout(timeout);
-
-                const text = await response.text();
-                const parser = new DOMParser();
-                const nextDoc = parser.parseFromString(text, 'text/html');
-
-                nextDoc.querySelectorAll('script').forEach(s => s.remove());
-
-                const nextImages = extractImageSources(nextDoc);
-                const newNextLink = findNextChapterLink(nextDoc);
-
-                if (nextImages.length > 0) {
-                    const currentChapterUrl = nextChapterHref;
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                    renderChapterSection(container, nextImages, capNum, currentChapterUrl);
-                    nextChapterHref = newNextLink;
-                    if (!nextChapterHref && !document.querySelector('.manga-end-message')) {
-                        appendEndMessage(container);
-                    }
-                } else {
-                    showChapterError(container);
-                    nextChapterHref = newNextLink;
-                    if (nextChapterHref) {
-                        await new Promise(resolve => setTimeout(resolve, 300));
-                        await fetchAndAppendNextChapter(container);
-                    } else if (!document.querySelector('.manga-end-message')) {
-                        appendEndMessage(container);
-                    }
-                }
-            } catch (e) {
-                if (e.name === 'AbortError') {
-                    console.error('Timeout ao buscar próximo capítulo');
-                } else {
-                    console.error('Erro ao buscar próximo capítulo:', e);
-                }
-                showChapterError(container);
-                const match = nextChapterHref.match(CHAPTER_REGEX);
-                capNum = match ? normalizeChapterNum(match[1]) : "?";
-                let newNextLink = null;
-                try {
-                    const response = await fetch(nextChapterHref, { signal: controller.signal });
-                    const text = await response.text();
-                    const parser = new DOMParser();
-                    const nextDoc = parser.parseFromString(text, 'text/html');
-                    newNextLink = findNextChapterLink(nextDoc);
-                } catch { }
-                nextChapterHref = newNextLink;
-                if (nextChapterHref) {
-                    await new Promise(resolve => setTimeout(resolve, 300));
-                    await fetchAndAppendNextChapter(container);
-                } else if (!document.querySelector('.manga-end-message')) {
-                    appendEndMessage(container);
-                }
-                if (loaderBar) {
-                    loaderBar.style.background = 'transparent';
-                    loaderBar.style.width = '100%';
-                    setTimeout(() => {
-                        loaderBar.style.width = '0%';
-                        loaderBar.style.background = 'transparent';
-                    }, 1000);
-                }
-            } finally {
-                isChapterLoading = false;
-                currentFetchPromise = null;
-                if (loaderBar) {
-                    loaderBar.style.width = '100%';
-                    clearTimeout(loaderHideTimeout);
-                    loaderHideTimeout = setTimeout(() => loaderBar.style.width = '0%', 200);
-                }
-            }
-        })();
-
-        return currentFetchPromise;
-    }
-
-    function findNextChapterLink(doc) {
-        const links = Array.from(doc.querySelectorAll(NEXT_LINK_SELECTORS));
-        const currentUrl = window.location.href;
-        const currentMatch = currentUrl.match(CHAPTER_REGEX);
-        const currentChapter = currentMatch ? parseFloat(currentMatch[1]) : 0;
-
-        for (const link of links) {
-            const href = link.href;
-            if (!isValidMangaUrl(href)) continue;
-
-            const match = href.match(CHAPTER_REGEX);
-            if (match) {
-                const nextChapter = parseFloat(match[1]);
-                if (nextChapter > currentChapter) {
-                    return href;
-                }
-            }
-        }
-
-        return null;
-    }
-
-    function appendEndMessage(container) {
-        if (!document.querySelector('.manga-end-message')) {
-            const endMessage = document.createElement('div');
-            endMessage.className = 'manga-end-message';
-            endMessage.textContent = 'Não há mais capítulos disponíveis';
-            container.appendChild(endMessage);
-        }
-    }
-
-    function createLibraryButton() {
-        const existingBtn = document.getElementById('manga-library-btn');
-        if (existingBtn) return;
-
-        const btn = document.createElement('div');
-        btn.className = 'manga-fab-btn';
-        btn.id = 'manga-library-btn';
-        const icon = document.createElement('i');
-        icon.className = 'fas fa-book';
-        btn.appendChild(icon);
-        btn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            toggleLibraryModal();
-        });
-        document.body.appendChild(btn);
-    }
-
-    function createEmptyLibraryRow() {
-        const row = document.createElement('div');
-        row.className = 'manga-modal-row';
-        row.textContent = "Histórico vazio.";
-        row.style.padding = "20px";
-        row.style.color = "#666";
-        return row;
-    }
-
-    function toggleLibraryModal() {
-        let modal = document.getElementById('manga-lib-modal');
-        if (modal) {
-            modal.remove();
-            if (onModalClose) {
-                document.removeEventListener('click', onModalClose);
-                onModalClose = null;
-            }
-            return;
-        }
-
-        const lib = getLibrary();
-        const sortedSlugs = Object.keys(lib).sort((a, b) => lib[b].timestamp - lib[a].timestamp);
-
-        modal = document.createElement('div');
-        modal.id = 'manga-lib-modal';
-        modal.className = 'manga-modal';
-
-        const header = document.createElement('div');
-        header.className = 'manga-modal-header';
-        header.textContent = 'Minha Biblioteca';
-        modal.appendChild(header);
-
-        if (sortedSlugs.length === 0) {
-            modal.appendChild(createEmptyLibraryRow());
-        }
-
-        sortedSlugs.forEach(slug => {
-            const item = lib[slug];
-            const row = document.createElement('a');
-            row.href = item.lastUrl;
-            row.className = 'manga-modal-row';
-
-            const titleSpan = document.createElement('span');
-            titleSpan.style.fontWeight = 'bold';
-            titleSpan.style.color = '#ff5500';
-            titleSpan.style.fontSize = '13px';
-            titleSpan.textContent = item.title;
-
-            const deleteBtn = document.createElement('span');
-            deleteBtn.className = 'delete-btn';
-            deleteBtn.style.color = '#888';
-            deleteBtn.style.cursor = 'pointer';
-            deleteBtn.style.fontSize = '18px';
-            deleteBtn.style.padding = '10px';
-            deleteBtn.style.display = 'inline-block';
-
-            const faIcon = document.createElement('i');
-            faIcon.className = 'fas fa-times';
-            deleteBtn.appendChild(faIcon);
-
-            const topDiv = document.createElement('div');
-            topDiv.style.display = 'flex';
-            topDiv.style.justifyContent = 'space-between';
-            topDiv.style.alignItems = 'center';
-            topDiv.appendChild(titleSpan);
-            topDiv.appendChild(deleteBtn);
-
-            const bottomDiv = document.createElement('div');
-            bottomDiv.style.fontSize = '12px';
-            bottomDiv.style.color = '#888';
-            bottomDiv.textContent = `Último: Cap. ${item.lastChapter}`;
-
-            row.appendChild(topDiv);
-            row.appendChild(bottomDiv);
-
-            deleteBtn.addEventListener('click', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                delete lib[slug];
-                saveLibraryToStorage(lib);
-                row.remove();
-                const remainingItemRows = modal.querySelectorAll('a.manga-modal-row');
-                if (remainingItemRows.length === 0) {
-                    modal.appendChild(createEmptyLibraryRow());
-                }
-            });
-            modal.appendChild(row);
-        });
-        document.body.appendChild(modal);
-
-        setTimeout(() => {
-            onModalClose = (e) => {
-                if (!modal.contains(e.target) && !e.target.closest('.manga-fab-btn')) {
-                    modal.remove();
-                    document.removeEventListener('click', onModalClose);
-                    onModalClose = null;
-                }
-            };
-            document.addEventListener('click', onModalClose);
-        }, 0);
-    }
-
-    function initWhenReady() {
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', () => {
-                initReaderMode();
-            });
+    isChapterLoading = true;
+
+    currentFetchPromise = (async function () {
+      if (loaderBar) loaderBar.style.width = "70%";
+
+      if (!pendingNextChapter) {
+        console.warn("[TL] pendingNextChapter vazio, nada a buscar");
+        isChapterLoading = false;
+        currentFetchPromise = null;
+        return;
+      }
+
+      try {
+        var info = pendingNextChapter;
+        pendingNextChapter = null;
+        console.log(
+          "[TL] buscando proximo capitulo:",
+          info.chapterNum,
+          "slug:",
+          info.mangaSlug,
+          "url:",
+          info.url,
+        );
+
+        var result = await activeSite.fetchChapterPages(
+          info.mangaSlug,
+          info.chapterNum,
+        );
+        console.log(
+          "[TL] resultado fetchNextChapter:",
+          result
+            ? "pages:" +
+                result.pages.length +
+                " nextCh:" +
+                (result.nextChapter ? result.nextChapter.chapterNum : "none")
+            : "null",
+        );
+
+        if (result && result.pages.length > 0) {
+          console.log(
+            "[TL] renderizando capitulo",
+            info.chapterNum,
+            "com",
+            result.pages.length,
+            "paginas",
+          );
+          renderChapterSection(
+            container,
+            result.pages,
+            info.chapterNum,
+            info.url,
+          );
+          _origReplaceState.call(window.history, {}, "", info.url);
+          if (result.nextChapter) {
+            pendingNextChapter = result.nextChapter;
+            console.log(
+              "[TL] pendingNextChapter atualizado:",
+              pendingNextChapter.chapterNum,
+            );
+          } else {
+            console.log("[TL] ultimo capitulo alcancado");
+            if (!document.querySelector(".manga-end-message"))
+              appendEndMessage(container);
+          }
         } else {
-            initReaderMode();
+          console.error("[TL] fetchChapterPages retornou sem paginas");
+          showChapterError(container);
         }
+      } catch (e) {
+        console.error("[TL] erro ao buscar proximo capitulo:", e.message || e);
+        pendingNextChapter = info;
+        showChapterError(container);
+      }
+
+      isChapterLoading = false;
+      currentFetchPromise = null;
+      if (loaderBar) {
+        loaderBar.style.width = "100%";
+        clearTimeout(loaderHideTimeout);
+        loaderHideTimeout = setTimeout(function () {
+          loaderBar.style.width = "0%";
+        }, 200);
+      }
+    })();
+
+    return currentFetchPromise;
+  }
+
+  function appendEndMessage(container) {
+    if (!document.querySelector(".manga-end-message")) {
+      var endMessage = document.createElement("div");
+      endMessage.className = "manga-end-message";
+      endMessage.textContent = "Não há mais capítulos disponíveis";
+      container.appendChild(endMessage);
+    }
+  }
+
+  function createLibraryButton() {
+    console.log("[TL] createLibraryButton — adicionando botao biblioteca");
+    var existingBtn = document.getElementById("manga-library-btn");
+    if (existingBtn) return;
+    var btn = document.createElement("div");
+    btn.className = "manga-fab-btn";
+    btn.id = "manga-library-btn";
+    var icon = document.createElement("i");
+    icon.className = "fas fa-book";
+    btn.appendChild(icon);
+    btn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      toggleLibraryModal();
+    });
+    document.body.appendChild(btn);
+  }
+
+  function createEmptyLibraryRow() {
+    var row = document.createElement("div");
+    row.className = "manga-modal-row";
+    row.textContent = "Histórico vazio.";
+    row.style.padding = "20px";
+    row.style.color = "#666";
+    return row;
+  }
+
+  function toggleLibraryModal() {
+    var modal = document.getElementById("manga-lib-modal");
+    if (modal) {
+      console.log("[TL] toggleLibraryModal — fechando");
+      modal.remove();
+      if (onModalClose) {
+        document.removeEventListener("click", onModalClose);
+        onModalClose = null;
+      }
+      return;
+    }
+    console.log("[TL] toggleLibraryModal — abrindo");
+
+    var lib = getLibrary();
+    var sortedSlugs = Object.keys(lib).sort(function (a, b) {
+      return lib[b].timestamp - lib[a].timestamp;
+    });
+
+    modal = document.createElement("div");
+    modal.id = "manga-lib-modal";
+    modal.className = "manga-modal";
+
+    var header = document.createElement("div");
+    header.className = "manga-modal-header";
+    header.textContent = "Minha Biblioteca";
+    modal.appendChild(header);
+
+    if (sortedSlugs.length === 0) modal.appendChild(createEmptyLibraryRow());
+
+    sortedSlugs.forEach(function (slug) {
+      const item = lib[slug];
+      const row = document.createElement("a");
+      row.href = item.lastUrl;
+      row.className = "manga-modal-row";
+
+      var titleSpan = document.createElement("span");
+      titleSpan.style.fontWeight = "bold";
+      titleSpan.style.color = "#ff5500";
+      titleSpan.style.fontSize = "13px";
+      titleSpan.textContent = item.title;
+
+      var deleteBtn = document.createElement("span");
+      deleteBtn.className = "delete-btn";
+      deleteBtn.style.color = "#888";
+      deleteBtn.style.cursor = "pointer";
+      deleteBtn.style.fontSize = "18px";
+      deleteBtn.style.padding = "10px";
+      deleteBtn.style.display = "inline-block";
+      var faIcon = document.createElement("i");
+      faIcon.className = "fas fa-times";
+      deleteBtn.appendChild(faIcon);
+
+      var topDiv = document.createElement("div");
+      topDiv.style.display = "flex";
+      topDiv.style.justifyContent = "space-between";
+      topDiv.style.alignItems = "center";
+      topDiv.appendChild(titleSpan);
+      topDiv.appendChild(deleteBtn);
+
+      var bottomDiv = document.createElement("div");
+      bottomDiv.style.fontSize = "12px";
+      bottomDiv.style.color = "#888";
+      bottomDiv.textContent = "Último: Cap. " + item.lastChapter;
+
+      row.appendChild(topDiv);
+      row.appendChild(bottomDiv);
+
+      deleteBtn.addEventListener("click", function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        delete lib[slug];
+        saveLibraryToStorage(lib);
+        row.remove();
+        var remainingItemRows = modal.querySelectorAll("a.manga-modal-row");
+        if (remainingItemRows.length === 0)
+          modal.appendChild(createEmptyLibraryRow());
+      });
+      modal.appendChild(row);
+    });
+    document.body.appendChild(modal);
+    console.log("[TL] biblioteca exibida com", sortedSlugs.length, "entradas");
+
+    setTimeout(function () {
+      onModalClose = function (e) {
+        if (!modal.contains(e.target) && !e.target.closest(".manga-fab-btn")) {
+          modal.remove();
+          document.removeEventListener("click", onModalClose);
+          onModalClose = null;
+        }
+      };
+      document.addEventListener("click", onModalClose);
+    }, 0);
+  }
+
+  function initReaderMode() {
+    console.log("[TL] initReaderMode start");
+    activeSite = detectSite();
+    console.log("[TL] detectSite:", activeSite ? activeSite.id : "null");
+    if (!activeSite) return;
+
+    if (isZenModeActive) {
+      console.log("[TL] cleanup previous session");
+      cleanupListeners();
+      isZenModeActive = false;
     }
 
-    if (AUTO_START) {
-        initWhenReady();
+    var isChapterPage = activeSite.isChapterPage();
+    console.log("[TL] isChapterPage:", isChapterPage);
+    if (!isChapterPage) return;
+
+    isZenModeActive = true;
+    initVisibilityObserver();
+    initLazyLoadObserver();
+
+    var data = getCurrentChapterData();
+    console.log(
+      "[TL] getCurrentChapterData: cap:",
+      data.currentCap,
+      "title:",
+      currentTitle,
+    );
+
+    var ui = rebuildReaderPage();
+    var mainContainer = ui.mainContainer;
+
+    var mangaSlug = activeSite.getMangaId();
+    var capNum = data.currentCap;
+    console.log(
+      "[TL] fetchChapterPages start slug:",
+      mangaSlug,
+      "cap:",
+      capNum,
+    );
+    if (mangaSlug && capNum) {
+      activeSite
+        .fetchChapterPages(mangaSlug, capNum)
+        .then(function (result) {
+          console.log(
+            "[TL] fetchChapterPages result:",
+            result
+              ? "pages:" +
+                  result.pages.length +
+                  ' title:"' +
+                  result.title +
+                  '" nextCh:' +
+                  (result.nextChapter ? result.nextChapter.chapterNum : "none")
+              : "null",
+          );
+          if (result && result.pages.length > 0) {
+            currentTitle = result.title || currentTitle;
+            console.log(
+              "[TL] renderizando capítulo",
+              capNum,
+              "com",
+              result.pages.length,
+              "páginas",
+            );
+            renderChapterSection(
+              mainContainer,
+              result.pages,
+              capNum,
+              window.location.href,
+            );
+            if (result.nextChapter) {
+              pendingNextChapter = result.nextChapter;
+              console.log(
+                "[TL] pendingNextChapter setado:",
+                pendingNextChapter.chapterNum,
+                pendingNextChapter.mangaSlug,
+              );
+            } else {
+              console.log("[TL] nenhum próximo capítulo disponível");
+              if (!document.querySelector(".manga-end-message"))
+                appendEndMessage(mainContainer);
+            }
+          } else {
+            console.error("[TL] fetchChapterPages retornou vazio ou null");
+            showChapterError(mainContainer);
+          }
+        })
+        .catch(function (err) {
+          console.error("[TL] Erro no fetchChapterPages:", err.message || err);
+          showChapterError(mainContainer);
+        });
+    } else {
+      console.warn(
+        "[TL] mangaSlug ou capNum vazio — slug:",
+        mangaSlug,
+        "cap:",
+        capNum,
+      );
     }
 
+    setTimeout(function () {
+      if (ui.hud) ui.hud.textContent = "Capítulo " + data.currentCap;
+      updateUIOnScroll();
+    }, 500);
+
+    setupEventHandlers(mainContainer);
+  }
+
+  function initWhenReady() {
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", function () {
+        initReaderMode();
+      });
+    } else {
+      initReaderMode();
+    }
+  }
+
+  (function () {
+    history.pushState = function (s, t, u) {
+      _origPushState.call(this, s, t, u);
+      setTimeout(initReaderMode, 100);
+    };
+    history.replaceState = function (s, t, u) {
+      _origReplaceState.call(this, s, t, u);
+      setTimeout(initReaderMode, 100);
+    };
+    window.addEventListener("popstate", function () {
+      setTimeout(initReaderMode, 100);
+    });
+  })();
+
+  if (AUTO_START) initWhenReady();
 })();
